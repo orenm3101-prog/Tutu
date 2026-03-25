@@ -1,0 +1,13 @@
+# Never commit these — they contain secrets
+.env
+credentials.json
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+venv/
+
+# Logs
+*.log

@@ -1,0 +1,58 @@
+# ──────────────────────────────────────────────────────────────────────────────
+# TUTU Scraper — GitHub Actions Workflow
+#
+# This workflow runs the scraper every 5 minutes, 24/7.
+# GitHub handles the scheduling — no server needed.
+#
+# IMPORTANT — Free tier note:
+#   Public repositories: unlimited free minutes ✓
+#   Private repositories: 2,000 free minutes/month (approx. 2.7 days of 5-min runs)
+#   → Keep this repository PUBLIC, or upgrade to a paid GitHub plan.
+#
+# ──────────────────────────────────────────────────────────────────────────────
+
+name: TUTU Scraper Agent
+
+on:
+  schedule:
+    # Runs every 30 minutes.
+    # Note: GitHub may delay runs by up to 1-2 minutes under high platform load.
+    - cron: "*/30 * * * *"
+
+  # Allows you to trigger a manual run from the GitHub Actions tab at any time
+  workflow_dispatch:
+
+jobs:
+  scrape:
+    name: Run Scraper Cycle
+    runs-on: ubuntu-latest
+
+    steps:
+      # 1. Check out the repository code
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      # 2. Set up Python
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: "pip"   # Caches installed packages between runs (faster)
+
+      # 3. Install Python dependencies
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      # 4. Run one scraper cycle and exit
+      #    All secrets are passed as environment variables.
+      #    The code in sheets.py reads GOOGLE_CREDENTIALS_JSON automatically.
+      - name: Run scraper (single cycle)
+        env:
+          # ── Required secrets (set these in GitHub → Settings → Secrets) ──
+          GOOGLE_CREDENTIALS_JSON: ${{ secrets.GOOGLE_CREDENTIALS_JSON }}
+          SPREADSHEET_ID:          ${{ secrets.SPREADSHEET_ID }}
+
+          # ── Optional variables (set in GitHub → Settings → Variables) ────
+          SHEET_TAB_NAME:          ${{ vars.SHEET_TAB_NAME || 'Tel-Aviv_Apartments' }}
+          LOG_LEVEL:               ${{ vars.LOG_LEVEL || 'INFO' }}
+        run: python main.py --once
