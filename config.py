@@ -42,4 +42,4 @@ MAX_ROOMS = 6
 # ── HTTP Settings ─────────────────────────────────────────────────────────────
 REQUEST_DELAY_SECONDS   = 2.0
 REQUEST_TIMEOUT_SECONDS = 15
-MAX_PAGES_PER_RUN       = 5
+MAX_PAGES_PER_RUN       = 10
