@@ -34,6 +34,7 @@ class Listing:
     is_renovated:     Optional[bool]  = None   # Column I
     contact_phone:    Optional[str]   = None   # Column L
     available_from:   Optional[str]   = None   # Column Q — Date string "DD/MM/YYYY"
+    is_broker:        Optional[bool]  = None   # Column U — True if posted by a broker/agent (מתווך)
 
     # ── Auto-populated fields (set by the database writer, not the scraper) ───
     publication_date: str = field(default_factory=lambda: datetime.now().strftime("%d/%m/%Y"))
@@ -74,4 +75,5 @@ class Listing:
             self.status,                         # R — סטטוס
             self.last_verified,                  # S — תאריך בדיקה
             self.added_by_agent,                 # T — הוסף על ידי
+            yesno(self.is_broker),               # U — מתווך
         ]

@@ -114,21 +114,21 @@ class Yad2Scraper(BaseScraper):
             logger.warning("[Yad2] Could not find realestate-rent-feed in __NEXT_DATA__")
             return []
 
-        # Combine private-owner and agency listings
-        raw_items = (
-            (rent_feed.get("private") or []) +
-            (rent_feed.get("agency") or [])
-        )
+        # Combine private-owner and agency listings, tagging broker status
+        # "private" = owner posting directly (is_broker=False)
+        # "agency"  = real-estate agency / broker (is_broker=True)
+        private_items = [(item, False) for item in (rent_feed.get("private") or [])]
+        agency_items  = [(item, True)  for item in (rent_feed.get("agency")  or [])]
 
         listings = []
-        for item in raw_items:
-            listing = self._parse_item(item)
+        for item, broker in private_items + agency_items:
+            listing = self._parse_item(item, is_broker=broker)
             if listing:
                 listings.append(listing)
 
         return listings
 
-    def _parse_item(self, item: dict) -> Optional[Listing]:
+    def _parse_item(self, item: dict, is_broker: bool = False) -> Optional[Listing]:
         """Parses a single listing dict from __NEXT_DATA__ into a Listing."""
         try:
             token  = item.get("token", "")
@@ -191,6 +191,7 @@ class Yad2Scraper(BaseScraper):
                 pets_allowed    = pets_allowed,
                 is_furnished    = is_furnished,
                 is_renovated    = is_renovated,
+                is_broker       = is_broker,
             )
 
         except Exception as e:
