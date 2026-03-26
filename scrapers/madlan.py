@@ -326,15 +326,31 @@ class MadlanScraper(BaseScraper):
 
             page = context.new_page()
 
+            # ── CDP-level request logging ────────────────────────────────────────
+            all_requests = []  # For debugging
+
+            def on_request(request):
+                url = request.url
+                if "api" in url.lower() or "madlan" in url:
+                    logger.debug(f"[Madlan] Request: {request.method} {url}")
+
+            page.on("request", on_request)
+
             # ── CDP-level response interception ───────────────────────────────
             def on_response(response):
                 url = response.url
-                if "/api2" in url or "/api3" in url:
+                status = response.status
+
+                # Log ALL requests for debugging
+                if "madlan.co.il" in url:
+                    all_requests.append((url, status))
+
+                if "/api2" in url or "/api3" in url or "/api" in url:
                     try:
                         data = response.json()
                         captured_jsons.append(data)
                         count = len(_extract_listings_from_response(data))
-                        logger.info(f"[Madlan] Captured API response: {count} items")
+                        logger.info(f"[Madlan] Captured API response ({status}): {count} items from {url}")
                     except Exception as exc:
                         logger.debug(f"[Madlan] Could not parse API response: {exc}")
 
@@ -354,7 +370,21 @@ class MadlanScraper(BaseScraper):
                 return []
 
             # Wait for initial API calls to complete
+            logger.info(f"[Madlan] Waiting {INITIAL_WAIT_MS}ms for initial load...")
             page.wait_for_timeout(INITIAL_WAIT_MS)
+
+            # Check page content to verify it loaded
+            try:
+                page_title = page.title()
+                logger.info(f"[Madlan] Page title: {page_title}")
+                # Get the page URL (might have redirected)
+                current_url = page.url
+                logger.info(f"[Madlan] Current URL: {current_url}")
+                # Check if we can find any listing elements
+                listing_count = page.locator("[data-testid*='listing'], [class*='listing']").count()
+                logger.info(f"[Madlan] Visible listing elements on page: {listing_count}")
+            except Exception as e:
+                logger.warning(f"[Madlan] Error checking page content: {e}")
 
             # ── Scroll to trigger lazy-loaded pages ───────────────────────────
             for i in range(MAX_PAGES_PER_RUN - 1):
@@ -366,6 +396,12 @@ class MadlanScraper(BaseScraper):
                 if new_count == 0:
                     logger.info("[Madlan] No new responses — stopping scrolls.")
                     break
+
+            # Log all requests made for debugging
+            if not captured_jsons:
+                logger.warning(f"[Madlan] No /api responses captured. All requests made:")
+                for url, status in all_requests[:20]:  # Log first 20
+                    logger.warning(f"  {status} {url}")
 
             browser.close()
             logger.info(f"[Madlan] Browser closed. Total API responses: {len(captured_jsons)}")
