@@ -6,13 +6,18 @@ HOW IT WORKS:
   All listing data is embedded directly in the HTML — no JSON API needed.
 
   Flow:
-    1. GET /rent/ to obtain session cookies + ASP.NET ViewState fields.
-    2. POST /rent/ with Tel Aviv city ID (203) to apply the city filter.
-    3. Parse listing rows from both tables in the returned HTML:
-         #mainresults   — private/owner listings   (is_broker = False)
+    1. GET /rent/ (and /rent/2, /rent/3 …) to fetch all listing table pages.
+    2. Parse listing rows from both tables in each page's HTML:
+         #mainresults    — private/owner listings  (is_broker = False)
          #relatedresults — broker/agency listings  (is_broker = True)
-    4. Paginate via GET /rent/2, /rent/3 … The session cookie (set in step 2)
-       carries the city filter forward to all subsequent GET requests.
+    3. Filter rows to keep only Tel Aviv ("תל אביב") listings.
+    4. For each Tel Aviv listing, GET its detail page to extract the rich
+       property features (size, mamad, balcony, pets, furnished, renovated).
+
+  Why plain GET (no POST city filter):
+    The ASP.NET city filter requires POSTing ViewState + session cookies.
+    Cloudflare blocks this POST from datacenter IPs (GitHub Actions).
+    Plain GET requests pass through fine via curl_cffi's Chrome TLS impersonation.
 
 TABLE COLUMN INDICES (0-based):
   Private rows (12 cells):
@@ -22,6 +27,23 @@ TABLE COLUMN INDICES (0-based):
   Broker rows (11 cells — no floor column):
     2=type  3=city  4=neighborhood  5=street  6=rooms
     7=price  8=available_from  9=last_updated  10=link
+
+DETAIL PAGE FEATURES:
+  All feature icons are <div class="IconOption on|off"> elements.
+  "on"  = feature IS present
+  "off" = feature is NOT present
+  Info items (size, floor) use class="IconOption " with no on/off marker.
+
+  Feature names we extract:
+    ריהוט        → is_furnished
+    מרפסת        → has_balcony  (also has count: "מרפסת: 2")
+    ממד           → has_mamad
+    משופצת       → is_renovated
+    חיות מחמד    → pets_allowed
+    גג            → has_rooftop
+    מ"ר: <n>     → size_sqm
+    קומה: <n>    → floor (overrides table value if present)
+    כניסה: <v>   → available_from (if not already set from table)
 
 URL PATTERNS:
   Private listing : https://www.homeless.co.il/rent/viewad,{ID}.aspx
@@ -34,6 +56,7 @@ CITY ID:
 import logging
 import re
 import time
+from dataclasses import replace
 from typing import List, Optional
 
 from bs4 import BeautifulSoup
@@ -47,12 +70,15 @@ logger = logging.getLogger(__name__)
 
 HOMELESS_HOME_URL   = "https://www.homeless.co.il"
 HOMELESS_RENT_URL   = "https://www.homeless.co.il/rent/"
-TEL_AVIV_CITY_ID    = "203"
 TEL_AVIV_CITY_NAME  = "תל אביב"
+
+# Seconds to sleep between detail-page fetches (gentle pacing)
+DETAIL_FETCH_SLEEP  = 0.3
 
 
 class HomelessScraper(BaseScraper):
-    """Scrapes rental listings from Homeless.co.il via HTML table parsing."""
+    """Scrapes rental listings from Homeless.co.il via HTML table parsing
+    plus individual detail-page enrichment for property features."""
 
     @property
     def source_name(self) -> str:
@@ -60,14 +86,8 @@ class HomelessScraper(BaseScraper):
 
     def fetch_listings(self) -> List[Listing]:
         """
-        Fetches pages from Homeless via plain GET requests (no POST/session needed).
-        City filtering is done in Python — only listings whose city starts with
-        "תל אביב" are kept, discarding Ramat Gan, Givatayim, Holon, etc.
-
-        Why no POST: the ASP.NET city filter requires ViewState + session cookies
-        that Cloudflare rejects from datacenter IPs (GitHub Actions). Plain GET
-        requests pass through fine because curl_cffi impersonates Chrome's TLS
-        fingerprint.
+        Phase 1 — Fetch all table pages and collect basic Tel Aviv listings.
+        Phase 2 — For each listing, GET its detail page to extract rich fields.
         """
         session = curl_requests.Session(impersonate="chrome110")
         session.headers.update({
@@ -78,7 +98,8 @@ class HomelessScraper(BaseScraper):
             "Accept":          "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
         })
 
-        all_listings = []
+        # ── Phase 1: collect basic listing data from table pages ───────────────
+        all_listings: List[Listing] = []
 
         for page in range(1, MAX_PAGES_PER_RUN + 1):
             if page == 1:
@@ -111,7 +132,80 @@ class HomelessScraper(BaseScraper):
                 f"{len(ta_listings)} Tel Aviv (running total: {len(all_listings)})"
             )
 
+        # ── Phase 2: enrich each Tel Aviv listing from its detail page ─────────
+        if all_listings:
+            logger.info(f"[Homeless] Enriching {len(all_listings)} listings from detail pages...")
+            enriched = []
+            for i, listing in enumerate(all_listings):
+                if i > 0:
+                    time.sleep(DETAIL_FETCH_SLEEP)
+                enriched.append(self._enrich_from_detail(session, listing))
+            return enriched
+
         return all_listings
+
+    # ── Detail-page enrichment ─────────────────────────────────────────────────
+
+    def _enrich_from_detail(self, session, listing: Listing) -> Listing:
+        """
+        GET the listing's detail page and extract property features
+        from <div class="IconOption on|off"> elements.
+        Returns a new Listing with the extra fields filled in.
+        """
+        try:
+            resp = session.get(
+                listing.ad_url,
+                headers={"Referer": HOMELESS_HOME_URL},
+                timeout=10,
+            )
+            if resp.status_code != 200:
+                return listing
+
+            soup = BeautifulSoup(resp.text, "html.parser")
+            updates = {}
+
+            for div in soup.find_all("div", class_="IconOption"):
+                classes  = div.get("class", [])
+                text     = div.get_text(" ", strip=True)
+                is_on    = "on"  in classes
+                is_off   = "off" in classes
+                is_bool  = is_on or is_off   # False for plain info items
+
+                if is_bool:
+                    # ── Boolean feature icons ─────────────────────────────────
+                    if "ריהוט" in text:
+                        updates["is_furnished"] = is_on
+                    elif "מרפסת" in text:
+                        updates["has_balcony"] = is_on
+                    elif "ממד" in text:
+                        updates["has_mamad"] = is_on
+                    elif "משופצ" in text:          # matches משופצת / משופץ
+                        updates["is_renovated"] = is_on
+                    elif "חיות מחמד" in text:
+                        updates["pets_allowed"] = is_on
+                    elif "גג" in text:
+                        updates["has_rooftop"] = is_on
+                else:
+                    # ── Numeric / info fields ─────────────────────────────────
+                    if 'מ"ר' in text:
+                        m = re.search(r'(\d+)', text)
+                        if m:
+                            updates["size_sqm"] = int(m.group(1))
+                    elif "קומה" in text:
+                        # "קומה: 7 מתוך 8" → floor = 7
+                        m = re.search(r'(\d+)', text)
+                        if m:
+                            updates["floor"] = int(m.group(1))
+                    elif "כניסה" in text and not listing.available_from:
+                        val = re.sub(r"כניסה\s*:\s*", "", text).strip()
+                        if val and val != "מיידי":
+                            updates["available_from"] = val
+
+            return replace(listing, **updates) if updates else listing
+
+        except Exception as e:
+            logger.debug(f"[Homeless] Enrich failed for {listing.ad_url}: {e}")
+            return listing
 
     @staticmethod
     def _is_tel_aviv(address: str) -> bool:
@@ -149,15 +243,13 @@ class HomelessScraper(BaseScraper):
 
     def _parse_row(self, row, is_broker: bool) -> Optional[Listing]:
         """
-        Parse one listing row.
+        Parse one listing row from the table.
 
         Private rows (12 cells): floor at col 7, price at col 8.
-        Broker rows  (11 cells): no floor,       price at col 7.
-        Distinction is made by is_broker flag (tables are already separate).
+        Broker rows  (11 cells): no floor,        price at col 7.
         """
         try:
             cells = row.find_all("td")
-            # Need at least city + rooms + price columns
             if len(cells) < 10:
                 return None
 
@@ -181,15 +273,13 @@ class HomelessScraper(BaseScraper):
             rooms = self._parse_float(cells[6].get_text(strip=True))
 
             if is_broker:
-                # 11-cell row: price at index 7, no floor
-                floor = None
-                price = self._parse_price(cells[7].get_text(strip=True))
-                available_raw = cells[8].get_text(strip=True)
+                floor          = None
+                price          = self._parse_price(cells[7].get_text(strip=True))
+                available_raw  = cells[8].get_text(strip=True)
             else:
-                # 12-cell row: floor at 7, price at 8
-                floor = self._parse_int(cells[7].get_text(strip=True))
-                price = self._parse_price(cells[8].get_text(strip=True))
-                available_raw = cells[9].get_text(strip=True)
+                floor          = self._parse_int(cells[7].get_text(strip=True))
+                price          = self._parse_price(cells[8].get_text(strip=True))
+                available_raw  = cells[9].get_text(strip=True)
 
             available_from = None if available_raw in ("מיידי", "") else available_raw
 

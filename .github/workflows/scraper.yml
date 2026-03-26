@@ -43,7 +43,12 @@ jobs:
       - name: Install dependencies
         run: pip install -r requirements.txt
 
-      # 4. Run one scraper cycle and exit
+      # 4. Install Playwright browser (needed for Madlan scraper)
+      #    Only downloads Chromium (~170 MB). Cached by actions/setup-python.
+      - name: Install Playwright Chromium
+        run: playwright install chromium --with-deps
+
+      # 5. Run one scraper cycle and exit
       #    All secrets are passed as environment variables.
       #    The code in sheets.py reads GOOGLE_CREDENTIALS_JSON automatically.
       - name: Run scraper (single cycle)
