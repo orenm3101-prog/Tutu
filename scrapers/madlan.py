@@ -35,7 +35,7 @@ import logging
 import re
 from typing import List, Optional, Any
 
-import requests
+from curl_cffi import requests as curl_requests
 
 from scrapers.base import BaseScraper
 from models import Listing
@@ -225,12 +225,12 @@ class MadlanScraper(BaseScraper):
         logger.info("[Madlan] Fetching page HTML to extract SSR listings...")
 
         try:
-            resp = requests.get(
+                        resp = curl_requests.get(
                 MADLAN_SEARCH_URL,
-                headers=REQUEST_HEADERS,
+                                impersonate="chrome120",
                 timeout=30,
             )
-        except requests.RequestException as exc:
+        except Exception as exc:
             logger.error(f"[Madlan] HTTP request failed: {exc}")
             return []
 
