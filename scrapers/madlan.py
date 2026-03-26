@@ -2,38 +2,34 @@
 madlan.py — Scraper for Madlan (madlan.co.il).
 
 HOW IT WORKS:
-  Madlan is a React SPA that loads listings via POST requests to /api2.
-  The API uses persisted GraphQL queries with custom auth — direct HTTP
-  POST requests from datacenter IPs are rejected ("sorry a1").
+  Madlan is a React SPA that loads listings dynamically. Instead of trying
+  to intercept API calls (which is unreliable in headless environments), we use
+  DOM parsing to extract listing data directly from the rendered HTML.
 
   We use Playwright (headless Chromium) to:
     1. Navigate to the Tel Aviv rentals search page.
-    2. Wait for /api2 responses via page.on("response") — this hooks at the
-       Chrome DevTools Protocol level, capturing ALL network traffic including
-       calls made from React's internally-cached fetch reference.
-    3. Parse the response JSON to extract listing data.
-    4. Scroll the page to trigger additional lazy-loaded API calls.
+    2. Wait for page to render.
+    3. Parse the DOM using CSS selectors to find and extract listing cards.
+    4. Scroll the page to trigger more listings to be rendered.
+    5. Repeat extraction until no new listings appear.
 
-  WHY PLAYWRIGHT?
-    - React caches the `fetch` reference at startup, so monkey-patching
-      window.fetch after page load doesn't intercept their API calls.
-    - XHR override likewise doesn't work (they use the Fetch API).
-    - Playwright's CDP-level interception is the only reliable way to
-      capture requests/responses from an SPA without modifying the app.
+  WHY THIS APPROACH?
+    - More reliable than API interception in restricted environments
+    - Works regardless of API endpoint changes
+    - Directly extracts what the user sees on screen
+    - Doesn't depend on understanding internal API structure
 
-KNOWN RESPONSE STRUCTURE (discovered empirically — see logs):
-  The /api2 endpoint returns JSON. The listings are found at:
-    data → userListingsV3 → listings → [{ listing: {...} }]
-  OR
-    data → userListingsV2 → listings → [{ listing: {...} }]
-
-  Each listing object has fields like:
-    id, price, rooms, floor, squareMeter, address (city/street/neighbourhood),
-    balconies, hasMamad, hasElevator, isFurnished, allowPets, entryDate, etc.
+LISTING STRUCTURE IN DOM:
+  Listings are rendered as cards with class names like:
+    - Price: [class containing "price"]
+    - Rooms: [text containing "חד'" or "rooms count"]
+    - Address/Location: [class containing "address"]
+    - Other features: [various data attributes]
 """
 
 import json
 import logging
+import re
 from typing import List, Any, Optional
 
 from scrapers.base import BaseScraper
@@ -221,70 +217,100 @@ def _parse_listing(raw: dict) -> Optional[Listing]:
     )
 
 
-def _extract_listings_from_response(data: dict) -> List[dict]:
+def _extract_listings_from_dom(soup) -> List[dict]:
     """
-    Walk the API response JSON to find the listing array.
-    Tries multiple known paths since the API structure may vary.
+    Extract listing data from the rendered DOM.
+    Since we can't rely on specific HTML structure, we parse the rendered HTML
+    to find links that point to individual listings (/item/XXX) and extract
+    nearby price/property information from the page.
     """
-    if not isinstance(data, dict):
-        return []
+    listings: List[dict] = []
 
-    logger.debug(f"[Madlan] API top-level keys: {list(data.keys())[:10]}")
+    try:
+        # Find all links that point to listing detail pages
+        listing_links = soup.find_all('a', href=re.compile(r'/item/\d+'))
+        logger.debug(f"[Madlan] Found {len(listing_links)} listing links")
 
-    # Path 1: data → userListingsV3 → listings
-    raw = _safe(data, "data", "userListingsV3", "listings")
-    if isinstance(raw, list) and raw:
-        return raw
+        seen_ids = set()
 
-    # Path 2: data → userListingsV2 → listings
-    raw = _safe(data, "data", "userListingsV2", "listings")
-    if isinstance(raw, list) and raw:
-        return raw
+        for link in listing_links:
+            try:
+                # Extract listing ID from href
+                href = link.get('href', '')
+                listing_id_match = re.search(r'/item/(\d+)', href)
+                if not listing_id_match:
+                    continue
 
-    # Path 3: data → listings (flat)
-    raw = _safe(data, "data", "listings")
-    if isinstance(raw, list) and raw:
-        return raw
+                listing_id = listing_id_match.group(1)
+                if listing_id in seen_ids:
+                    continue
+                seen_ids.add(listing_id)
 
-    # Path 4: listings at root
-    raw = data.get("listings")
-    if isinstance(raw, list) and raw:
-        return raw
+                # Get the listing card container (usually the parent or nearby element)
+                card = link
+                for _ in range(10):  # Walk up the tree to find the card container
+                    if card.parent:
+                        card = card.parent
+                        # Look for text that contains property info
+                        text = card.get_text()
+                        if '₪' in text and ('חד' in text or 'מ"ר' in text):
+                            break
 
-    # Path 5: deep search for any array of dicts that look like listings
-    def _find_list(obj, depth=0):
-        if depth > 6 or not isinstance(obj, dict):
-            return None
-        for v in obj.values():
-            if isinstance(v, list) and len(v) > 0:
-                first = v[0]
-                if isinstance(first, dict) and any(
-                    k in first for k in ("price", "listing", "rooms", "id", "dealId")
-                ):
-                    return v
-            result = _find_list(v, depth + 1)
-            if result:
-                return result
-        return None
+                listing_text = card.get_text()
 
-    found = _find_list(data)
-    if found:
-        logger.info(f"[Madlan] Found listing array via deep search ({len(found)} items)")
-        return found
+                # Create a basic listing dict
+                listing = {"id": listing_id}
 
-    logger.warning(
-        f"[Madlan] Could not find listings array in API response. "
-        f"Top-level keys: {list(data.keys())}"
-    )
-    return []
+                # Extract price (₪ followed by numbers)
+                price_match = re.search(r'₪\s*([\d,]+)', listing_text)
+                if price_match:
+                    listing['price'] = int(price_match.group(1).replace(',', ''))
+
+                # Extract rooms (numbers followed by "חד" or "rooms")
+                rooms_match = re.search(r'(\d+(?:\.\d+)?)\s*(?:חד|חדרים|rooms?)', listing_text)
+                if rooms_match:
+                    listing['rooms'] = float(rooms_match.group(1))
+
+                # Extract square meters (number followed by m"r or sqm)
+                size_match = re.search(r'(\d+)\s*(?:מ"?ר|sqm)', listing_text)
+                if size_match:
+                    listing['squareMeter'] = int(size_match.group(1))
+
+                # Extract floor
+                floor_match = re.search(r'קומה\s*(?:קרקע|(\d+))', listing_text)
+                if floor_match and floor_match.group(1):
+                    listing['floor'] = int(floor_match.group(1))
+                elif 'קרקע' in listing_text:
+                    listing['floor'] = 0
+
+                # Try to find address in nearby text
+                # Address usually follows the property type and size info
+                address_match = re.search(r'(?:דירה|דו-משפחתי|פנטהאוז|קוטג|בית)[^,]*,\s*([^,\n]+(?:,[^,\n]+)?)', listing_text)
+                if address_match:
+                    listing['address'] = address_match.group(1).strip()
+
+                listings.append(listing)
+
+            except Exception as e:
+                logger.debug(f"[Madlan] Error parsing listing link: {e}")
+                continue
+
+        logger.debug(f"[Madlan] Extracted {len(listings)} unique listings from DOM")
+
+    except Exception as e:
+        logger.error(f"[Madlan] Error extracting listings from DOM: {e}")
+        import traceback
+        logger.debug(f"[Madlan] Traceback: {traceback.format_exc()}")
+
+    return listings
 
 
 class MadlanScraper(BaseScraper):
     """
-    Scrapes rental listings from Madlan using Playwright headless browser.
+    Scrapes rental listings from Madlan using Playwright + DOM parsing.
 
-    Playwright intercepts /api2 responses at the CDP level — this works even
-    though React caches the fetch() reference internally at startup.
+    Uses headless Chromium to load the page and parse the rendered DOM,
+    extracting listing data directly from the HTML.
     """
 
     @property
@@ -294,14 +320,13 @@ class MadlanScraper(BaseScraper):
     def fetch_listings(self) -> List[Listing]:
         try:
             from playwright.sync_api import sync_playwright
+            from bs4 import BeautifulSoup
         except ImportError:
             logger.error(
-                "[Madlan] playwright not installed. "
-                "Run: pip install playwright && playwright install chromium"
+                "[Madlan] Required packages not installed. "
+                "Run: pip install playwright beautifulsoup4 && playwright install chromium"
             )
             return []
-
-        captured_jsons: List[dict] = []
 
         logger.info("[Madlan] Starting headless Chromium browser...")
 
@@ -326,49 +351,6 @@ class MadlanScraper(BaseScraper):
 
             page = context.new_page()
 
-            # ── CDP-level request logging ────────────────────────────────────────
-            all_requests = []  # For debugging
-            request_count = {"total": 0, "api": 0, "xhr": 0, "fetch": 0}
-
-            def on_request(request):
-                url = request.url
-                request_count["total"] += 1
-
-                # Log API-like requests
-                if any(x in url.lower() for x in ["api", "graphql", "gql", "data", "search"]):
-                    request_count["api"] += 1
-                    logger.info(f"[Madlan] REQUEST: {request.method} {url}")
-
-                # Track XHR/Fetch
-                req_type = request.resource_type
-                if req_type in ("xhr", "fetch"):
-                    if req_type == "xhr":
-                        request_count["xhr"] += 1
-                    else:
-                        request_count["fetch"] += 1
-
-            page.on("request", on_request)
-
-            # ── CDP-level response interception ───────────────────────────────
-            def on_response(response):
-                url = response.url
-                status = response.status
-
-                # Log ALL requests for debugging
-                if "madlan.co.il" in url:
-                    all_requests.append((url, status))
-
-                if "/api2" in url or "/api3" in url or "/api" in url:
-                    try:
-                        data = response.json()
-                        captured_jsons.append(data)
-                        count = len(_extract_listings_from_response(data))
-                        logger.info(f"[Madlan] Captured API response ({status}): {count} items from {url}")
-                    except Exception as exc:
-                        logger.debug(f"[Madlan] Could not parse API response: {exc}")
-
-            page.on("response", on_response)
-
             # ── Navigate to Tel Aviv rentals ──────────────────────────────────
             logger.info("[Madlan] Navigating to Tel Aviv rentals page...")
             try:
@@ -382,82 +364,71 @@ class MadlanScraper(BaseScraper):
                 browser.close()
                 return []
 
-            # Wait for initial API calls to complete
-            logger.info(f"[Madlan] Waiting {INITIAL_WAIT_MS}ms for initial load...")
+            # Wait for page to fully render
+            logger.info(f"[Madlan] Waiting {INITIAL_WAIT_MS}ms for page to render...")
             page.wait_for_timeout(INITIAL_WAIT_MS)
 
-            # Check page content to verify it loaded
+            # Check page loaded
             try:
                 page_title = page.title()
                 logger.info(f"[Madlan] Page title: {page_title}")
-                # Get the page URL (might have redirected)
-                current_url = page.url
-                logger.info(f"[Madlan] Current URL: {current_url}")
-                # Check if we can find any listing elements
-                listing_count = page.locator("[data-testid*='listing'], [class*='listing']").count()
-                logger.info(f"[Madlan] Visible listing elements on page: {listing_count}")
             except Exception as e:
-                logger.warning(f"[Madlan] Error checking page content: {e}")
+                logger.warning(f"[Madlan] Error reading page title: {e}")
 
-            # ── Scroll to trigger lazy-loaded pages ───────────────────────────
-            for i in range(MAX_PAGES_PER_RUN - 1):
-                before = len(captured_jsons)
-                page.evaluate("window.scrollBy(0, window.innerHeight * 3)")
-                page.wait_for_timeout(SCROLL_WAIT_MS)
-                new_count = len(captured_jsons) - before
-                logger.info(f"[Madlan] Scroll {i+1}: {new_count} new API responses")
-                if new_count == 0:
-                    logger.info("[Madlan] No new responses — stopping scrolls.")
+            # ── Scroll and extract listings ───────────────────────────────────
+            all_listings_raw: List[dict] = []
+            seen_ids: set = set()
+
+            for scroll_num in range(MAX_PAGES_PER_RUN):
+                # Get current page HTML and parse listings
+                page_html = page.content()
+                soup = BeautifulSoup(page_html, "html.parser")
+
+                # Extract listings from the page (BeautifulSoup parsing)
+                new_listings = _extract_listings_from_dom(soup)
+                before_count = len(all_listings_raw)
+
+                # Add new listings (avoiding duplicates)
+                for listing_raw in new_listings:
+                    listing_id = listing_raw.get("id")
+                    if listing_id and listing_id not in seen_ids:
+                        all_listings_raw.append(listing_raw)
+                        seen_ids.add(listing_id)
+
+                new_count = len(all_listings_raw) - before_count
+                logger.info(f"[Madlan] Scroll {scroll_num + 1}: extracted {new_count} new listings (total: {len(all_listings_raw)})")
+
+                # Stop if no new listings found
+                if new_count == 0 and scroll_num > 0:
+                    logger.info("[Madlan] No new listings found — stopping scrolls.")
                     break
 
-            # Log request statistics
-            logger.info(
-                f"[Madlan] Request stats - Total: {request_count['total']}, "
-                f"API-like: {request_count['api']}, XHR: {request_count['xhr']}, "
-                f"Fetch: {request_count['fetch']}"
-            )
-
-            # Log all requests made for debugging
-            if not captured_jsons:
-                logger.warning(f"[Madlan] No /api responses captured. Sample requests made:")
-                for url, status in all_requests[:20]:  # Log first 20
-                    logger.warning(f"  {status} {url}")
+                # Scroll down to trigger lazy loading
+                if scroll_num < MAX_PAGES_PER_RUN - 1:
+                    page.evaluate("window.scrollBy(0, window.innerHeight * 3)")
+                    page.wait_for_timeout(SCROLL_WAIT_MS)
 
             browser.close()
-            logger.info(f"[Madlan] Browser closed. Total API responses: {len(captured_jsons)}")
+            logger.info(f"[Madlan] Browser closed. Total listings extracted: {len(all_listings_raw)}")
 
-        # ── Parse all captured responses ──────────────────────────────────────
-        seen_ids: set = set()
+        # ── Parse all extracted listings ──────────────────────────────────────
         listings: List[Listing] = []
 
-        for data in captured_jsons:
-            raw_list = _extract_listings_from_response(data)
-            for raw in raw_list:
-                try:
-                    listing = _parse_listing(raw)
-                except Exception as exc:
-                    logger.debug(f"[Madlan] Parse error on listing: {exc}")
-                    continue
+        for raw in all_listings_raw:
+            try:
+                listing = _parse_listing(raw)
+            except Exception as exc:
+                logger.debug(f"[Madlan] Parse error on listing: {exc}")
+                continue
 
-                if listing is None:
-                    continue
-                if listing.ad_id in seen_ids:
-                    continue
-                seen_ids.add(listing.ad_id)
+            if listing is None:
+                continue
 
-                # Keep only Tel Aviv results (the page may return nearby cities)
-                if TEL_AVIV_CITY not in listing.city:
-                    continue
+            # Keep only Tel Aviv results
+            if TEL_AVIV_CITY not in listing.city:
+                continue
 
-                listings.append(listing)
+            listings.append(listing)
 
         logger.info(f"[Madlan] Unique Tel Aviv listings parsed: {len(listings)}")
-
-        # ── If parsing found nothing, dump raw sample to help debug ──────────
-        if captured_jsons and not listings:
-            sample = json.dumps(captured_jsons[0], ensure_ascii=False, indent=2)[:3000]
-            logger.info(
-                "[Madlan] Parsing found 0 listings. Raw API sample:\n" + sample
-            )
-
         return listings
