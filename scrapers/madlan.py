@@ -328,11 +328,24 @@ class MadlanScraper(BaseScraper):
 
             # ── CDP-level request logging ────────────────────────────────────────
             all_requests = []  # For debugging
+            request_count = {"total": 0, "api": 0, "xhr": 0, "fetch": 0}
 
             def on_request(request):
                 url = request.url
-                if "api" in url.lower() or "madlan" in url:
-                    logger.debug(f"[Madlan] Request: {request.method} {url}")
+                request_count["total"] += 1
+
+                # Log API-like requests
+                if any(x in url.lower() for x in ["api", "graphql", "gql", "data", "search"]):
+                    request_count["api"] += 1
+                    logger.info(f"[Madlan] REQUEST: {request.method} {url}")
+
+                # Track XHR/Fetch
+                req_type = request.resource_type
+                if req_type in ("xhr", "fetch"):
+                    if req_type == "xhr":
+                        request_count["xhr"] += 1
+                    else:
+                        request_count["fetch"] += 1
 
             page.on("request", on_request)
 
@@ -397,9 +410,16 @@ class MadlanScraper(BaseScraper):
                     logger.info("[Madlan] No new responses — stopping scrolls.")
                     break
 
+            # Log request statistics
+            logger.info(
+                f"[Madlan] Request stats - Total: {request_count['total']}, "
+                f"API-like: {request_count['api']}, XHR: {request_count['xhr']}, "
+                f"Fetch: {request_count['fetch']}"
+            )
+
             # Log all requests made for debugging
             if not captured_jsons:
-                logger.warning(f"[Madlan] No /api responses captured. All requests made:")
+                logger.warning(f"[Madlan] No /api responses captured. Sample requests made:")
                 for url, status in all_requests[:20]:  # Log first 20
                     logger.warning(f"  {status} {url}")
 
