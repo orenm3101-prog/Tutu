@@ -44,9 +44,12 @@ jobs:
         run: pip install -r requirements.txt
 
       # 4. Install Playwright browser (needed for Madlan scraper)
-      #    Only downloads Chromium (~170 MB). Cached by actions/setup-python.
+      #    ubuntu-latest (24.04) renames libasound2 → libasound2t64, so we
+      #    install system deps manually first, then download Chromium.
       - name: Install Playwright Chromium
-        run: playwright install chromium --with-deps
+        run: |
+          sudo apt-get install -y libasound2t64 || true
+          playwright install chromium --with-deps
 
       # 5. Run one scraper cycle and exit
       #    All secrets are passed as environment variables.
