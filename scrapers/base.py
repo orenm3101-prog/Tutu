@@ -1,7 +1,15 @@
 """
 base.py — Abstract base class that every scraper must implement.
-This enforces a consistent interface so new scrapers (Madlan, Facebook, etc.)
-can be added later without changing the main runner.
+
+WHY curl_cffi?
+  Yad2 and Homeless are both protected by Cloudflare, which blocks plain
+  HTTP requests from datacenter IPs (e.g. GitHub Actions). The standard
+  `requests` library is detected and served a bot-challenge page.
+
+  curl_cffi is a Python binding for libcurl that impersonates Chrome's
+  exact TLS fingerprint (JA3/ALPN/HTTP2 settings). This makes our requests
+  indistinguishable from a real Chrome browser at the network level, which
+  is enough to bypass Cloudflare's JS-challenge and bot-score checks.
 """
 
 import logging
@@ -10,7 +18,7 @@ import random
 from abc import ABC, abstractmethod
 from typing import List
 
-import requests
+from curl_cffi import requests as curl_requests
 
 from models import Listing
 from config import REQUEST_DELAY_SECONDS, REQUEST_TIMEOUT_SECONDS
@@ -19,37 +27,23 @@ logger = logging.getLogger(__name__)
 
 
 class BaseScraper(ABC):
-    """
-    All scrapers inherit from this class.
-    They only need to implement `fetch_listings()`.
-    """
-
-    # Rotate through these user agents to reduce bot-detection risk
-    USER_AGENTS = [
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-        "(KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36",
-        "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 "
-        "(KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36",
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:122.0) Gecko/20100101 Firefox/122.0",
-        "Mozilla/5.0 (Macintosh; Intel Mac OS X 14_2_1) AppleWebKit/605.1.15 "
-        "(KHTML, like Gecko) Version/17.2 Safari/605.1.15",
-    ]
+    """All scrapers inherit from this class."""
 
     def __init__(self):
-        self.session = requests.Session()
-        self._rotate_user_agent()
+        # impersonate="chrome110" uses Chrome 110's exact TLS fingerprint
+        self.session = curl_requests.Session(impersonate="chrome110")
+        self.session.headers.update({
+            "User-Agent":       "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                                "AppleWebKit/537.36 (KHTML, like Gecko) "
+                                "Chrome/110.0.0.0 Safari/537.36",
+            "Accept-Language":  "he-IL,he;q=0.9,en-US;q=0.8",
+        })
 
-    def _rotate_user_agent(self):
-        """Pick a random user agent for this session."""
-        ua = random.choice(self.USER_AGENTS)
-        self.session.headers.update({"User-Agent": ua})
-
-    def _get(self, url: str, params: dict = None, headers: dict = None) -> requests.Response:
+    def _get(self, url: str, params: dict = None, headers: dict = None):
         """
-        Makes a GET request with built-in delay and error handling.
-        Raises requests.HTTPError on non-2xx responses.
+        Makes a GET request with polite delay and error handling.
+        Uses curl_cffi session with Chrome TLS fingerprint.
         """
-        # Polite delay: randomize slightly around the configured delay
         delay = REQUEST_DELAY_SECONDS + random.uniform(0, 1.0)
         time.sleep(delay)
 
@@ -58,26 +52,17 @@ class BaseScraper(ABC):
                 url,
                 params=params,
                 headers=headers,
-                timeout=REQUEST_TIMEOUT_SECONDS
+                timeout=REQUEST_TIMEOUT_SECONDS,
             )
             response.raise_for_status()
             return response
-        except requests.exceptions.Timeout:
-            logger.warning(f"Request timed out: {url}")
-            raise
-        except requests.exceptions.HTTPError as e:
-            logger.warning(f"HTTP error {e.response.status_code} for: {url}")
-            raise
-        except requests.exceptions.ConnectionError:
-            logger.error(f"Connection failed: {url}")
+        except Exception as e:
+            logger.warning(f"HTTP error for {url}: {e}")
             raise
 
     @abstractmethod
     def fetch_listings(self) -> List[Listing]:
-        """
-        Fetch all new listings from this source.
-        Must return a list of Listing objects.
-        """
+        """Fetch all new listings from this source. Returns list of Listing objects."""
         pass
 
     @property

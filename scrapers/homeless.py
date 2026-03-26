@@ -18,8 +18,9 @@ NOTE ON API ENDPOINT:
 import logging
 import re
 import time
-import requests
 from typing import List, Optional
+
+from curl_cffi import requests as curl_requests
 
 from scrapers.base import BaseScraper
 from models import Listing
@@ -40,12 +41,12 @@ class HomelessScraper(BaseScraper):
         return "Homeless"
 
     def fetch_listings(self) -> List[Listing]:
-        # Create a session and warm it up with the homepage to get cookies
-        session = requests.Session()
+        # Use curl_cffi to impersonate Chrome's TLS fingerprint (bypasses Cloudflare)
+        session = curl_requests.Session(impersonate="chrome110")
         session.headers.update({
             "User-Agent":       "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
                                 "AppleWebKit/537.36 (KHTML, like Gecko) "
-                                "Chrome/122.0.0.0 Safari/537.36",
+                                "Chrome/110.0.0.0 Safari/537.36",
             "Accept-Language":  "he-IL,he;q=0.9,en-US;q=0.8",
             "Accept":           "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
         })
