@@ -41,7 +41,7 @@ from curl_cffi import requests as curl_requests
 
 from scrapers.base import BaseScraper
 from models import Listing
-from config import MIN_PRICE, MAX_PRICE, MIN_ROOMS, MAX_ROOMS, MAX_PAGES_PER_RUN
+from config import MAX_PAGES_PER_RUN
 
 logger = logging.getLogger(__name__)
 
@@ -59,6 +59,16 @@ class HomelessScraper(BaseScraper):
         return "HOMELESS"
 
     def fetch_listings(self) -> List[Listing]:
+        """
+        Fetches pages from Homeless via plain GET requests (no POST/session needed).
+        City filtering is done in Python — only listings whose city starts with
+        "תל אביב" are kept, discarding Ramat Gan, Givatayim, Holon, etc.
+
+        Why no POST: the ASP.NET city filter requires ViewState + session cookies
+        that Cloudflare rejects from datacenter IPs (GitHub Actions). Plain GET
+        requests pass through fine because curl_cffi impersonates Chrome's TLS
+        fingerprint.
+        """
         session = curl_requests.Session(impersonate="chrome110")
         session.headers.update({
             "User-Agent":      "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
@@ -68,100 +78,45 @@ class HomelessScraper(BaseScraper):
             "Accept":          "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
         })
 
-        # ── Step 1: GET the page to collect session cookie + ViewState ────────
-        try:
-            logger.info("[Homeless] GET /rent/ for cookies + ViewState...")
-            get_resp = session.get(HOMELESS_RENT_URL, timeout=15)
-            get_resp.raise_for_status()
-        except Exception as e:
-            logger.error(f"[Homeless] Initial GET failed: {e}")
-            return []
-
-        soup_init = BeautifulSoup(get_resp.text, "html.parser")
-
-        def _hidden(name: str) -> str:
-            el = soup_init.find("input", {"name": name})
-            return el["value"] if el and el.get("value") else ""
-
-        viewstate        = _hidden("__VIEWSTATE")
-        viewstate_gen    = _hidden("__VIEWSTATEGENERATOR")
-        event_validation = _hidden("__EVENTVALIDATION")
-
-        if not viewstate:
-            logger.warning("[Homeless] ViewState not found in page — continuing without it")
-
-        time.sleep(1.5)
-
-        # ── Step 2: POST with Tel Aviv city filter ────────────────────────────
-        post_data = {
-            "__VIEWSTATE":                        viewstate,
-            "__VIEWSTATEGENERATOR":               viewstate_gen,
-            "__EVENTVALIDATION":                  event_validation,
-            "ctl00$hdnBoardType":                 "rent",
-            "ctl00$hdnShouldShowWelcomePopup":    "0",
-            "iNumber1":                           TEL_AVIV_CITY_ID,
-            "city":                               TEL_AVIV_CITY_NAME,
-            "iNumber3":                           "",
-            "iNumber4":                           str(int(MIN_ROOMS)) if MIN_ROOMS else "1",
-            "iNumber4_1":                         str(int(MAX_ROOMS)) if MAX_ROOMS else "16",
-            "fLong3":                             str(MIN_PRICE) if MIN_PRICE else "1000",
-            "fLong3_1":                           str(MAX_PRICE) if MAX_PRICE else "1000000",
-            "iNumber12":                          "-2",
-            "iNumber12_1":                        "51",
-            "SearchFor":                          "",
-            "boardType":                          "rent",
-            "view":                               "",
-        }
-
-        try:
-            logger.info("[Homeless] POST city filter (Tel Aviv)...")
-            post_resp = session.post(
-                HOMELESS_RENT_URL,
-                data=post_data,
-                headers={"Referer": HOMELESS_RENT_URL},
-                timeout=15,
-            )
-            post_resp.raise_for_status()
-        except Exception as e:
-            logger.error(f"[Homeless] POST failed: {e}")
-            return []
-
         all_listings = []
 
-        # Parse page 1 from POST response
-        page1 = self._parse_html(post_resp.text)
-        all_listings.extend(page1)
-        logger.info(f"[Homeless] Page 1: {len(page1)} listings (total: {len(all_listings)})")
+        for page in range(1, MAX_PAGES_PER_RUN + 1):
+            if page == 1:
+                page_url = HOMELESS_RENT_URL
+            else:
+                page_url = f"{HOMELESS_HOME_URL}/rent/{page}"
+                time.sleep(1.5)
 
-        if not page1:
-            logger.warning("[Homeless] Page 1 returned 0 listings — city filter may have failed")
-            return all_listings
-
-        # ── Pages 2+ via GET (session cookie keeps the city filter) ──────────
-        for page in range(2, MAX_PAGES_PER_RUN + 1):
-            time.sleep(1.5)
-            page_url = f"{HOMELESS_HOME_URL}/rent/{page}"
             try:
                 resp = session.get(
                     page_url,
-                    headers={"Referer": HOMELESS_RENT_URL},
+                    headers={"Referer": HOMELESS_HOME_URL},
                     timeout=15,
                 )
                 resp.raise_for_status()
             except Exception as e:
-                logger.error(f"[Homeless] Page {page} GET failed: {e}")
+                logger.error(f"[Homeless] Page {page} failed: {e}")
                 break
 
             page_listings = self._parse_html(resp.text)
+            ta_listings   = [l for l in page_listings if self._is_tel_aviv(l.address)]
+
             if not page_listings:
-                logger.info(f"[Homeless] Page {page}: no listings, stopping.")
+                logger.info(f"[Homeless] Page {page}: no listings found, stopping.")
                 break
 
-            all_listings.extend(page_listings)
-            logger.info(f"[Homeless] Page {page}: {len(page_listings)} listings "
-                        f"(total: {len(all_listings)})")
+            all_listings.extend(ta_listings)
+            logger.info(
+                f"[Homeless] Page {page}: {len(page_listings)} total, "
+                f"{len(ta_listings)} Tel Aviv (running total: {len(all_listings)})"
+            )
 
         return all_listings
+
+    @staticmethod
+    def _is_tel_aviv(address: str) -> bool:
+        """Returns True if the address belongs to Tel Aviv-Jaffa."""
+        return "תל אביב" in address
 
     # ── HTML parsing ──────────────────────────────────────────────────────────
 
