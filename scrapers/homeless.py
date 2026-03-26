@@ -79,7 +79,7 @@ class HomelessScraper(BaseScraper):
 
         return all_listings
 
-    def _fetch_page(self, session: requests.Session, page: int) -> List[Listing]:
+    def _fetch_page(self, session: curl_requests.Session, page: int) -> List[Listing]:
         """Fetches a single page using the warmed-up session."""
 
         params = {
