@@ -184,7 +184,7 @@ class SheetsDB:
 
     def _read_all_rows(self) -> List[dict]:
         """Reads the full sheet and returns rows as dicts keyed by field name."""
-        range_name = f"{SHEET_TAB_NAME}!A1:T"
+        range_name = f"{SHEET_TAB_NAME}!A1:U"
         try:
             result = self._service.spreadsheets().values().get(
                 spreadsheetId=SPREADSHEET_ID,
@@ -203,7 +203,7 @@ class SheetsDB:
             "has_rooftop", "pets_allowed", "is_furnished", "is_renovated",
             "source_platform", "publication_date", "contact_phone", "ad_url",
             "unique_id", "price", "rooms", "available_from", "status",
-            "last_verified", "added_by_agent"
+            "last_verified", "added_by_agent", "is_broker"
         ]
 
         result_list = []

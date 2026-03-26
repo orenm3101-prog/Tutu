@@ -46,7 +46,7 @@ class Yad2Scraper(BaseScraper):
 
     @property
     def source_name(self) -> str:
-        return "Yad2"
+        return "YAD2"
 
     def fetch_listings(self) -> List[Listing]:
         all_listings = []

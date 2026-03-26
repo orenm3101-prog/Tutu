@@ -56,7 +56,7 @@ class HomelessScraper(BaseScraper):
 
     @property
     def source_name(self) -> str:
-        return "Homeless"
+        return "HOMELESS"
 
     def fetch_listings(self) -> List[Listing]:
         session = curl_requests.Session(impersonate="chrome110")
