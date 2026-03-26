@@ -25,31 +25,22 @@ on:
 jobs:
   scrape:
     name: Run Scraper Cycle
-    runs-on: ubuntu-latest
+    # Self-hosted runner runs on your local machine (residential IP).
+    # This is required because Madlan blocks GitHub's cloud datacenter IPs.
+    # Setup: run Install-GitHubRunner.ps1 from the repo root on your Windows PC.
+    runs-on: self-hosted
 
     steps:
       # 1. Check out the repository code
       - name: Checkout code
         uses: actions/checkout@v4
 
-      # 2. Set up Python
-      - name: Set up Python 3.11
-        uses: actions/setup-python@v5
-        with:
-          python-version: "3.11"
-          cache: "pip"   # Caches installed packages between runs (faster)
-
-      # 3. Install Python dependencies
+      # 2. Install Python dependencies
+      #    (Python must be installed on the self-hosted runner machine)
       - name: Install dependencies
         run: pip install -r requirements.txt
 
-      # 4. Install Playwright browser (needed for Madlan scraper)
-      #    Skip --with-deps: ubuntu-latest (24.04) runners already have all
-      #    required shared libs; --with-deps fails on the libasound2 rename.
-      - name: Install Playwright Chromium
-        run: playwright install chromium
-
-      # 5. Run one scraper cycle and exit
+      # 3. Run one scraper cycle and exit
       #    All secrets are passed as environment variables.
       #    The code in sheets.py reads GOOGLE_CREDENTIALS_JSON automatically.
       - name: Run scraper (single cycle)
