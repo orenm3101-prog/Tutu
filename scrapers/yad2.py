@@ -50,23 +50,39 @@ class Yad2Scraper(BaseScraper):
 
     def fetch_listings(self) -> List[Listing]:
         all_listings = []
+        listings_too_old = 0
 
         for page in range(1, MAX_PAGES_PER_RUN + 1):
-            logger.info(f"[Yad2] Fetching page {page}...")
+            logger.info(f"[YAD2] Fetching page {page}...")
             try:
                 page_listings = self._fetch_page(page)
             except Exception as e:
-                logger.error(f"[Yad2] Failed on page {page}: {e}")
+                logger.error(f"[YAD2] Failed on page {page}: {e}")
                 break
 
             if not page_listings:
-                logger.info(f"[Yad2] No listings on page {page}, stopping.")
+                logger.info(f"[YAD2] No listings on page {page}, stopping.")
                 break
 
-            all_listings.extend(page_listings)
-            logger.info(f"[Yad2] Page {page}: {len(page_listings)} listings "
-                        f"(total: {len(all_listings)})")
+            # Filter by publication date (incremental scanning)
+            new_listings = []
+            for listing in page_listings:
+                if listing._is_newer_than(self.since_timestamp):
+                    new_listings.append(listing)
+                else:
+                    listings_too_old += 1
+                    # Once we hit old listings, they'll only get older going forward
+                    if listings_too_old > 3:  # Allow a few old ones, then stop
+                        logger.info(f"[YAD2] Found {listings_too_old} old listings, stopping early.")
+                        self._update_last_scan_time()
+                        return all_listings
 
+            all_listings.extend(new_listings)
+            logger.info(f"[YAD2] Page {page}: {len(new_listings)} new listings, "
+                        f"{len(page_listings) - len(new_listings)} old (total: {len(all_listings)})")
+
+        # Update last scan time after successful completion
+        self._update_last_scan_time()
         return all_listings
 
     def _fetch_page(self, page: int) -> List[Listing]:
@@ -149,6 +165,11 @@ class Yad2Scraper(BaseScraper):
             if not address:
                 return None
 
+            # ── Publication Date ──────────────────────────────────────────────
+            # Try to extract publication date from the listing
+            # YAD2 may have lastModified or publishDate in metadata
+            pub_date_str = self._extract_publication_date(item)
+
             # ── Price / Rooms / Size ──────────────────────────────────────────
             price    = item.get("price")
             details  = item.get("additionalDetails", {})
@@ -177,7 +198,7 @@ class Yad2Scraper(BaseScraper):
             # ── Image ─────────────────────────────────────────────────────────
             image_url = item.get("metaData", {}).get("coverImage", "")
 
-            return Listing(
+            listing = Listing(
                 address         = address,
                 source_platform = self.source_name,
                 ad_url          = ad_url,
@@ -194,8 +215,79 @@ class Yad2Scraper(BaseScraper):
                 is_broker       = is_broker,
             )
 
+            # Override publication_date if we extracted it
+            if pub_date_str:
+                listing.publication_date = pub_date_str
+
+            return listing
+
         except Exception as e:
-            logger.warning(f"[Yad2] Error parsing item: {e}")
+            logger.warning(f"[YAD2] Error parsing item: {e}")
+            return None
+
+    def _extract_publication_date(self, item: dict) -> Optional[str]:
+        """
+        Try to extract publication date from item.
+        Returns date string in DD/MM/YYYY format, or None if not found.
+        """
+        try:
+            # Try various possible date fields in YAD2's data structure
+            # YAD2 may have: metaData.publishDate, createdAt, lastModified, etc.
+            metadata = item.get("metaData", {})
+
+            # Try publishDate first
+            pub_date = metadata.get("publishDate") or item.get("publishDate")
+            if pub_date:
+                return self._parse_date(pub_date)
+
+            # Try lastModified
+            last_mod = metadata.get("lastModified") or item.get("lastModified")
+            if last_mod:
+                return self._parse_date(last_mod)
+
+            # Try createdAt
+            created = metadata.get("createdAt") or item.get("createdAt")
+            if created:
+                return self._parse_date(created)
+
+            return None
+        except Exception as e:
+            logger.debug(f"[YAD2] Could not extract publication date: {e}")
+            return None
+
+    @staticmethod
+    def _parse_date(date_obj) -> Optional[str]:
+        """
+        Parse various date formats from YAD2 and return DD/MM/YYYY string.
+        Handles: ISO strings, timestamps, already-formatted dates, etc.
+        """
+        try:
+            from datetime import datetime
+
+            # If it's a string
+            if isinstance(date_obj, str):
+                # Try ISO format
+                try:
+                    dt = datetime.fromisoformat(date_obj.replace("Z", "+00:00"))
+                    return dt.strftime("%d/%m/%Y")
+                except:
+                    pass
+
+                # Try to parse as-is
+                for fmt in ["%d/%m/%Y", "%Y-%m-%d", "%d-%m-%Y"]:
+                    try:
+                        dt = datetime.strptime(date_obj[:10], fmt)
+                        return dt.strftime("%d/%m/%Y")
+                    except:
+                        pass
+
+            # If it's a number (likely timestamp)
+            elif isinstance(date_obj, (int, float)):
+                dt = datetime.fromtimestamp(date_obj / 1000)  # Handle milliseconds
+                return dt.strftime("%d/%m/%Y")
+
+            return None
+        except Exception:
             return None
 
     # ── Helpers ───────────────────────────────────────────────────────────────

@@ -16,12 +16,14 @@ import logging
 import time
 import random
 from abc import ABC, abstractmethod
-from typing import List
+from datetime import datetime
+from typing import List, Optional
 
 from curl_cffi import requests as curl_requests
 
 from models import Listing
 from config import REQUEST_DELAY_SECONDS, REQUEST_TIMEOUT_SECONDS
+from database.scanner_state import ScannerState
 
 logger = logging.getLogger(__name__)
 
@@ -38,6 +40,10 @@ class BaseScraper(ABC):
                                 "Chrome/110.0.0.0 Safari/537.36",
             "Accept-Language":  "he-IL,he;q=0.9,en-US;q=0.8",
         })
+
+        # Initialize scanner state for incremental scanning
+        self.scanner_state = ScannerState()
+        self.since_timestamp = self.scanner_state.get_since_timestamp(self.source_name)
 
     def _get(self, url: str, params: dict = None, headers: dict = None):
         """
@@ -68,5 +74,12 @@ class BaseScraper(ABC):
     @property
     @abstractmethod
     def source_name(self) -> str:
-        """Human-readable name of this source, e.g. 'Yad2'."""
+        """Human-readable name of this source, e.g. 'YAD2'."""
         pass
+
+    def _update_last_scan_time(self, scan_time: Optional[datetime] = None):
+        """
+        Update the last scan timestamp for this source.
+        Call this at the END of fetch_listings() to record that the scan completed.
+        """
+        self.scanner_state.update_scan_time(self.source_name, scan_time)

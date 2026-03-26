@@ -86,7 +86,8 @@ class HomelessScraper(BaseScraper):
 
     def fetch_listings(self) -> List[Listing]:
         """
-        Phase 1 — Fetch all table pages and collect basic Tel Aviv listings.
+        Phase 1 — Fetch table pages and collect basic Tel Aviv listings.
+        Phase 1b — Filter by publication date (incremental scanning)
         Phase 2 — For each listing, GET its detail page to extract rich fields.
         """
         session = curl_requests.Session(impersonate="chrome110")
@@ -100,6 +101,7 @@ class HomelessScraper(BaseScraper):
 
         # ── Phase 1: collect basic listing data from table pages ───────────────
         all_listings: List[Listing] = []
+        old_listings_count = 0
 
         for page in range(1, MAX_PAGES_PER_RUN + 1):
             if page == 1:
@@ -126,11 +128,25 @@ class HomelessScraper(BaseScraper):
                 logger.info(f"[Homeless] Page {page}: no listings found, stopping.")
                 break
 
-            all_listings.extend(ta_listings)
+            # Filter by publication date (incremental scanning)
+            new_listings = []
+            for listing in ta_listings:
+                if listing._is_newer_than(self.since_timestamp):
+                    new_listings.append(listing)
+                else:
+                    old_listings_count += 1
+
+            all_listings.extend(new_listings)
             logger.info(
                 f"[Homeless] Page {page}: {len(page_listings)} total, "
-                f"{len(ta_listings)} Tel Aviv (running total: {len(all_listings)})"
+                f"{len(new_listings)} new, {old_listings_count} old (running total: {len(all_listings)})"
             )
+
+            # Stop early if we're only hitting old listings
+            if new_listings == 0 and old_listings_count > 5:
+                logger.info(f"[Homeless] Stopping — only old listings found.")
+                self._update_last_scan_time()
+                return all_listings
 
         # ── Phase 2: enrich each Tel Aviv listing from its detail page ─────────
         if all_listings:
@@ -140,8 +156,13 @@ class HomelessScraper(BaseScraper):
                 if i > 0:
                     time.sleep(DETAIL_FETCH_SLEEP)
                 enriched.append(self._enrich_from_detail(session, listing))
+
+            # Update last scan time after successful completion
+            self._update_last_scan_time()
             return enriched
 
+        # Update last scan time even if no new listings
+        self._update_last_scan_time()
         return all_listings
 
     # ── Detail-page enrichment ─────────────────────────────────────────────────

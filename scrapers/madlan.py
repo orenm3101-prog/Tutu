@@ -411,6 +411,9 @@ class MadlanScraper(BaseScraper):
             browser.close()
             logger.info(f"[Madlan] Browser closed. Total listings extracted: {len(all_listings_raw)}")
 
+            # Update last scan time after successful extraction
+            self._update_last_scan_time()
+
         # ── Parse all extracted listings ──────────────────────────────────────
         listings: List[Listing] = []
 

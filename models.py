@@ -37,10 +37,25 @@ class Listing:
     is_broker:        Optional[bool]  = None   # Column U — True if posted by a broker/agent (מתווך)
 
     # ── Auto-populated fields (set by the database writer, not the scraper) ───
+    # publication_date can be set by scraper if available, defaults to now
     publication_date: str = field(default_factory=lambda: datetime.now().strftime("%d/%m/%Y"))
     status:           str = "Active"            # Column R
     last_verified:    str = field(default_factory=lambda: datetime.now().strftime("%d/%m/%Y"))
     added_by_agent:   str = "Agent-1A"          # Column T
+
+    def _is_newer_than(self, cutoff_dt: datetime) -> bool:
+        """
+        Check if this listing was published after cutoff_dt.
+        Used for incremental scanning.
+
+        publication_date is stored as "DD/MM/YYYY" string in the listing.
+        """
+        try:
+            listing_dt = datetime.strptime(self.publication_date, "%d/%m/%Y")
+            return listing_dt >= cutoff_dt
+        except Exception:
+            # If date parsing fails, assume it's new (be conservative)
+            return True
 
     def to_sheet_row(self) -> list:
         """
