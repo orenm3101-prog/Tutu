@@ -2,48 +2,53 @@
 yad2.py — Scraper for Yad2 (yad2.co.il), Israel's largest real estate portal.
 
 HOW IT WORKS:
-  Yad2's website loads listings via an internal JSON API (the same API their
-  website's JavaScript calls). We call that API directly — no HTML parsing needed.
-  The API returns structured JSON with full listing details.
+  Yad2's internal JSON API (gw.yad2.co.il) now blocks server-side requests
+  with a 503 response. Instead, we fetch the rendered HTML search page and
+  extract the __NEXT_DATA__ JSON block that Next.js embeds in every page.
+  This block contains the first page of listings pre-loaded — no API key or
+  session token required, since it's part of the public HTML response.
 
-RATE LIMITING:
-  Yad2 may return 429 (Too Many Requests) or block the IP if requests are too
-  frequent. The base class adds a randomized delay between every request.
+PAGINATION:
+  Each HTML page contains ~20 private + ~20 agency listings.
+  We iterate pages via the ?page=N query parameter.
   MAX_PAGES_PER_RUN in config.py limits how many pages we fetch per cycle.
+
+LISTING URL:
+  Each listing has a unique token (e.g. "wka1ncc9").
+  The public URL is: https://www.yad2.co.il/item/{token}
 """
 
+import json
 import logging
 import re
 from typing import List, Optional
 
+from bs4 import BeautifulSoup
+
 from scrapers.base import BaseScraper
 from models import Listing
-from config import (
-    YAD2_CITY_CODE, MIN_PRICE, MAX_PRICE,
-    MIN_ROOMS, MAX_ROOMS, MAX_PAGES_PER_RUN
-)
+from config import YAD2_CITY_CODE, MAX_PAGES_PER_RUN
 
 logger = logging.getLogger(__name__)
 
-# Yad2's internal feed API endpoint
-YAD2_API_URL = "https://gw.yad2.co.il/feed-search-legacy/realestate/rent"
+# Search page URL — Next.js embeds listing data directly in the HTML
+YAD2_SEARCH_URL    = "https://www.yad2.co.il/realestate/rent/tel-aviv-area"
+YAD2_LISTING_BASE  = "https://www.yad2.co.il/item/"
 
-# Yad2 listing detail base URL (used to build the full ad URL)
-YAD2_LISTING_BASE_URL = "https://www.yad2.co.il/item/"
+# Tag IDs for boolean features (discovered by inspecting __NEXT_DATA__)
+TAG_PARKING  = 1003   # חניה
+TAG_BALCONY  = 1009   # מרפסת  (may vary — we also check description)
+TAG_ELEVATOR = 1010   # מעלית
 
 
 class Yad2Scraper(BaseScraper):
-    """Scrapes rental listings from Yad2."""
+    """Scrapes rental listings from Yad2 via HTML __NEXT_DATA__ parsing."""
 
     @property
     def source_name(self) -> str:
         return "Yad2"
 
     def fetch_listings(self) -> List[Listing]:
-        """
-        Fetches up to MAX_PAGES_PER_RUN pages of listings from Yad2.
-        Returns a flat list of Listing objects.
-        """
         all_listings = []
 
         for page in range(1, MAX_PAGES_PER_RUN + 1):
@@ -55,52 +60,68 @@ class Yad2Scraper(BaseScraper):
                 break
 
             if not page_listings:
-                logger.info(f"[Yad2] No more results on page {page}, stopping.")
+                logger.info(f"[Yad2] No listings on page {page}, stopping.")
                 break
 
             all_listings.extend(page_listings)
-            logger.info(f"[Yad2] Page {page}: got {len(page_listings)} listings "
-                        f"(total so far: {len(all_listings)})")
+            logger.info(f"[Yad2] Page {page}: {len(page_listings)} listings "
+                        f"(total: {len(all_listings)})")
 
         return all_listings
 
     def _fetch_page(self, page: int) -> List[Listing]:
-        """Fetches a single page from the Yad2 API and parses the results."""
+        """Fetches one HTML page and extracts listings from __NEXT_DATA__."""
 
         params = {
-            "city":       YAD2_CITY_CODE,
-            "priceOnly":  "1",
-            "page":       str(page),
+            "area":   "1",
+            "city":   YAD2_CITY_CODE,
+            "page":   str(page),
         }
-        if MIN_PRICE:
-            params["price"] = f"{MIN_PRICE}-{MAX_PRICE}"
-        if MIN_ROOMS:
-            params["rooms"] = f"{MIN_ROOMS}-{MAX_ROOMS}"
 
-        # Yad2's API requires these headers to return JSON instead of redirecting
+        # Mimic a real browser so the server returns full HTML with __NEXT_DATA__
         headers = {
-            "Accept":          "application/json, text/plain, */*",
-            "Accept-Language": "he-IL,he;q=0.9,en-US;q=0.8",
-            "Referer":         "https://www.yad2.co.il/realestate/rent",
-            "Origin":          "https://www.yad2.co.il",
+            "Accept":           "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+            "Accept-Language":  "he-IL,he;q=0.9,en-US;q=0.8",
+            "Referer":          "https://www.yad2.co.il/",
         }
 
-        response = self._get(YAD2_API_URL, params=params, headers=headers)
-        data = response.json()
+        response = self._get(YAD2_SEARCH_URL, params=params, headers=headers)
 
-        # The API returns: { "data": { "feed": { "feed_items": [...] } } }
-        feed_items = (
-            data.get("data", {})
-                .get("feed", {})
-                .get("feed_items", [])
+        # Parse the __NEXT_DATA__ JSON block from the HTML
+        soup = BeautifulSoup(response.text, "html.parser")
+        next_data_tag = soup.find("script", {"id": "__NEXT_DATA__"})
+        if not next_data_tag:
+            logger.warning("[Yad2] __NEXT_DATA__ not found in page HTML")
+            return []
+
+        next_data = json.loads(next_data_tag.string)
+
+        # Dig into the dehydrated React Query state to find the rent feed
+        queries = (
+            next_data.get("props", {})
+                     .get("pageProps", {})
+                     .get("dehydratedState", {})
+                     .get("queries", [])
+        )
+
+        rent_feed = None
+        for q in queries:
+            if q.get("queryKey", [None])[0] == "realestate-rent-feed":
+                rent_feed = q.get("state", {}).get("data", {})
+                break
+
+        if not rent_feed:
+            logger.warning("[Yad2] Could not find realestate-rent-feed in __NEXT_DATA__")
+            return []
+
+        # Combine private-owner and agency listings
+        raw_items = (
+            (rent_feed.get("private") or []) +
+            (rent_feed.get("agency") or [])
         )
 
         listings = []
-        for item in feed_items:
-            # Skip promotional / agency items that are not real listings
-            if item.get("type") in ("commercial", "agency_banner", "premium_banner"):
-                continue
-
+        for item in raw_items:
             listing = self._parse_item(item)
             if listing:
                 listings.append(listing)
@@ -108,104 +129,79 @@ class Yad2Scraper(BaseScraper):
         return listings
 
     def _parse_item(self, item: dict) -> Optional[Listing]:
-        """
-        Parses a single Yad2 feed item dict into a Listing object.
-        Returns None if the item is missing critical fields.
-        """
+        """Parses a single listing dict from __NEXT_DATA__ into a Listing."""
         try:
-            item_id   = item.get("id") or item.get("token", "")
-            ad_url    = f"{YAD2_LISTING_BASE_URL}{item_id}" if item_id else ""
+            token  = item.get("token", "")
+            ad_url = f"{YAD2_LISTING_BASE}{token}" if token else ""
 
             # ── Address ──────────────────────────────────────────────────────
-            city          = item.get("city_text", "")
-            neighborhood  = item.get("neighborhood_text") or item.get("area_text", "")
-            street        = item.get("street", "") or item.get("street_text", "")
-            house_number  = str(item.get("house_number", "")) or ""
-            address_parts = [p for p in [street, house_number, neighborhood, city] if p]
-            address       = ", ".join(address_parts) if address_parts else city
+            addr          = item.get("address", {})
+            city          = addr.get("city", {}).get("text", "")
+            neighborhood  = addr.get("neighborhood", {}).get("text", "")
+            street        = addr.get("street", {}).get("text", "")
+            house_num     = str(addr.get("house", {}).get("number", "") or "")
+            floor_raw     = addr.get("house", {}).get("floor")
+            floor         = int(floor_raw) if floor_raw is not None else None
+
+            address_parts = [p for p in [street, house_num, neighborhood, city] if p]
+            address       = ", ".join(address_parts) or city
 
             if not address:
-                logger.debug(f"[Yad2] Skipping item {item_id}: no address")
                 return None
 
-            # ── Price ─────────────────────────────────────────────────────────
-            price_raw = item.get("price") or item.get("Price")
-            price     = self._parse_int(str(price_raw)) if price_raw else None
+            # ── Price / Rooms / Size ──────────────────────────────────────────
+            price    = item.get("price")
+            details  = item.get("additionalDetails", {})
+            rooms    = details.get("roomsCount")
+            size_sqm = details.get("squareMeter")
+            prop_type = details.get("property", {}).get("text", "")
 
-            # ── Rooms ─────────────────────────────────────────────────────────
-            rooms_raw = item.get("rooms") or item.get("Rooms")
-            rooms     = self._parse_float(str(rooms_raw)) if rooms_raw else None
+            # ── Features from tags ────────────────────────────────────────────
+            tag_ids = {t.get("id") for t in item.get("tags", [])}
+            tag_names = " ".join(t.get("name", "") for t in item.get("tags", []))
 
-            # ── Size ──────────────────────────────────────────────────────────
-            size_raw = item.get("square_meters") or item.get("SquareMeter")
-            size_sqm = self._parse_int(str(size_raw)) if size_raw else None
+            has_parking  = TAG_PARKING  in tag_ids or None
+            has_balcony  = TAG_BALCONY  in tag_ids or None
+            has_rooftop  = self._detect(tag_names, ["גג", "penthouse"]) or None
 
-            # ── Floor ─────────────────────────────────────────────────────────
-            floor_raw = item.get("floor") or item.get("FloorNumber")
-            floor     = self._parse_int(str(floor_raw)) if floor_raw else None
+            # Fallback: detect from tag names (free text)
+            full_text = tag_names.lower()
+            if has_balcony  is None: has_balcony  = self._detect(full_text, ["מרפסת", "balcony"])
+            if has_parking  is None: has_parking  = self._detect(full_text, ["חניה", "parking"])
 
-            # ── Phone ─────────────────────────────────────────────────────────
-            contact_phone = item.get("contact_phone") or item.get("phone_number", "")
+            pets_allowed = self._detect(full_text, ["חיות מחמד", "כלב", "חתול", "pets"])
+            is_furnished = self._detect(full_text, ["מרוהט", "furnished"])
+            is_renovated = self._detect(full_text, ["משופץ", "renovated"])
+            has_mamad    = self._detect(full_text, ['ממ"ד', "ממד", "mamad"])
 
-            # ── Boolean features — parsed from free-text tags ──────────────
-            tags_text = " ".join([
-                item.get("info_text", ""),
-                item.get("additional_info_text", ""),
-                " ".join(item.get("tags", [])),
-                item.get("title_1", ""),
-                item.get("title_2", ""),
-            ]).lower()
-
-            has_mamad     = self._detect(tags_text, ["ממ\"ד", "ממד", "mamad"])
-            has_balcony   = self._detect(tags_text, ["מרפסת", "balcony"])
-            has_rooftop   = self._detect(tags_text, ["גג", "roof", "penthouse"])
-            pets_allowed  = self._detect(tags_text, ["חיות מחמד", "בע\"ח", "כלב", "חתול", "pets"])
-            is_furnished  = self._detect(tags_text, ["מרוהט", "furnished"])
-            is_renovated  = self._detect(tags_text, ["משופץ", "שיפוץ", "renovated"])
+            # ── Image ─────────────────────────────────────────────────────────
+            image_url = item.get("metaData", {}).get("coverImage", "")
 
             return Listing(
-                address        = address,
-                source_platform= self.source_name,
-                ad_url         = ad_url,
-                price          = price,
-                rooms          = rooms,
-                floor          = floor,
-                size_sqm       = size_sqm,
-                has_mamad      = has_mamad,
-                has_balcony    = has_balcony,
-                has_rooftop    = has_rooftop,
-                pets_allowed   = pets_allowed,
-                is_furnished   = is_furnished,
-                is_renovated   = is_renovated,
-                contact_phone  = contact_phone,
+                address         = address,
+                source_platform = self.source_name,
+                ad_url          = ad_url,
+                price           = price,
+                rooms           = rooms,
+                floor           = floor,
+                size_sqm        = size_sqm,
+                has_mamad       = has_mamad,
+                has_balcony     = has_balcony,
+                has_rooftop     = has_rooftop,
+                pets_allowed    = pets_allowed,
+                is_furnished    = is_furnished,
+                is_renovated    = is_renovated,
             )
 
         except Exception as e:
-            logger.warning(f"[Yad2] Error parsing item: {e} — item keys: {list(item.keys())}")
+            logger.warning(f"[Yad2] Error parsing item: {e}")
             return None
 
     # ── Helpers ───────────────────────────────────────────────────────────────
 
     @staticmethod
-    def _parse_int(value: str) -> Optional[int]:
-        """Extracts the first integer from a string like '4,500 ₪' → 4500."""
-        digits = re.sub(r"[^\d]", "", value)
-        return int(digits) if digits else None
-
-    @staticmethod
-    def _parse_float(value: str) -> Optional[float]:
-        """Extracts a float from a string like '2.5 rooms' → 2.5."""
-        match = re.search(r"[\d]+\.?[\d]*", value)
-        return float(match.group()) if match else None
-
-    @staticmethod
     def _detect(text: str, keywords: list) -> Optional[bool]:
-        """
-        Returns True if any keyword is found in text, None if not found.
-        We use None (not False) when a feature isn't mentioned — the absence
-        of a keyword doesn't necessarily mean the feature is absent.
-        """
         for kw in keywords:
-            if kw.lower() in text:
+            if kw.lower() in text.lower():
                 return True
         return None
