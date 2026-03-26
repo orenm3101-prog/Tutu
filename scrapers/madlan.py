@@ -30,6 +30,8 @@ LISTING STRUCTURE IN DOM:
 import json
 import logging
 import re
+import time
+import random
 from typing import List, Any, Optional
 
 from scrapers.base import BaseScraper
@@ -337,6 +339,9 @@ class MadlanScraper(BaseScraper):
                     "--no-sandbox",
                     "--disable-dev-shm-usage",
                     "--disable-blink-features=AutomationControlled",
+                    "--disable-web-security",
+                    "--disable-features=IsolateOrigins,site-per-process",
+                    "--allow-running-insecure-content",
                 ],
             )
             context = browser.new_context(
@@ -347,22 +352,54 @@ class MadlanScraper(BaseScraper):
                 ),
                 viewport={"width": 1280, "height": 800},
                 locale="he-IL",
+                extra_http_headers={
+                    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8",
+                    "Accept-Language": "he-IL,he;q=0.9,en;q=0.8",
+                    "Accept-Encoding": "gzip, deflate, br",
+                    "DNT": "1",
+                    "Connection": "keep-alive",
+                    "Upgrade-Insecure-Requests": "1",
+                    "Sec-Fetch-Dest": "document",
+                    "Sec-Fetch-Mode": "navigate",
+                    "Sec-Fetch-Site": "none",
+                    "Cache-Control": "max-age=0",
+                },
+                ignore_https_errors=True,
             )
 
             page = context.new_page()
 
+            # ── Set up request/response logging ───────────────────────────────
+            def log_response(response):
+                if "madlan" in response.url:
+                    logger.debug(f"[Madlan] Response: {response.url} -> Status {response.status}")
+                    if response.status >= 400:
+                        logger.warning(f"[Madlan] ERROR Response: {response.url} -> {response.status}")
+
+            page.on("response", log_response)
+
             # ── Navigate to Tel Aviv rentals ──────────────────────────────────
             logger.info("[Madlan] Navigating to Tel Aviv rentals page...")
             try:
+                # First, try with waitUntil="networkidle"
                 page.goto(
                     MADLAN_SEARCH_URL,
-                    wait_until="domcontentloaded",
-                    timeout=30_000,
+                    wait_until="networkidle",
+                    timeout=45_000,
                 )
             except Exception as exc:
-                logger.error(f"[Madlan] Page navigation failed: {exc}")
-                browser.close()
-                return []
+                logger.warning(f"[Madlan] Page navigation with networkidle failed: {exc}")
+                # Fallback: try with just domcontentloaded
+                try:
+                    page.goto(
+                        MADLAN_SEARCH_URL,
+                        wait_until="domcontentloaded",
+                        timeout=30_000,
+                    )
+                except Exception as exc2:
+                    logger.error(f"[Madlan] Page navigation failed: {exc2}")
+                    browser.close()
+                    return []
 
             # Wait for page to fully render
             logger.info(f"[Madlan] Waiting {INITIAL_WAIT_MS}ms for page to render...")
@@ -372,6 +409,11 @@ class MadlanScraper(BaseScraper):
             try:
                 page_title = page.title()
                 logger.info(f"[Madlan] Page title: {page_title}")
+
+                # Log page status
+                page_html = page.content()
+                if "520" in page_html or "error" in page_html.lower():
+                    logger.warning(f"[Madlan] Page contains error indicators. HTML length: {len(page_html)}")
             except Exception as e:
                 logger.warning(f"[Madlan] Error reading page title: {e}")
 
@@ -405,8 +447,11 @@ class MadlanScraper(BaseScraper):
 
                 # Scroll down to trigger lazy loading
                 if scroll_num < MAX_PAGES_PER_RUN - 1:
+                    # Add human-like random delay (1-3 seconds) between scrolls
+                    random_wait = random.uniform(1000, 3000)
                     page.evaluate("window.scrollBy(0, window.innerHeight * 3)")
-                    page.wait_for_timeout(SCROLL_WAIT_MS)
+                    logger.debug(f"[Madlan] Scrolling... waiting {random_wait:.0f}ms before next extraction")
+                    page.wait_for_timeout(int(random_wait))
 
             browser.close()
             logger.info(f"[Madlan] Browser closed. Total listings extracted: {len(all_listings_raw)}")
