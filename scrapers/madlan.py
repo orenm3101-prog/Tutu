@@ -262,10 +262,21 @@ class MadlanScraper(BaseScraper):
             return []
 
         json_text = html[json_start:script_end].strip().rstrip(';').strip()
+
+        # Next.js SSR data often contains JavaScript-only tokens that are not
+        # valid JSON.  Replace them with null before parsing.
+        json_text = re.sub(r'\bundefined\b', 'null', json_text)
+        json_text = re.sub(r'\bNaN\b',       'null', json_text)
+        json_text = re.sub(r'-?Infinity\b',  'null', json_text)
+
         try:
             ctx = json.loads(json_text)
         except json.JSONDecodeError as exc:
+            # Log context around the error to aid future debugging
+            pos = exc.pos
+            snippet = json_text[max(0, pos - 80): pos + 80]
             logger.error(f"[Madlan] Failed to parse SSR JSON: {exc}")
+            logger.error(f"[Madlan] Context around error (char {pos}): {repr(snippet)}")
             return []
 
         # ── Navigate to the listings array ────────────────────────────────────
