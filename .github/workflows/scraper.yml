@@ -52,5 +52,5 @@ jobs:
           # ── Optional variables (set in GitHub → Settings → Variables) ────
           SHEET_TAB_NAME:          ${{ vars.SHEET_TAB_NAME || 'Tel-Aviv_Apartments' }}
           LOG_LEVEL:               ${{ vars.LOG_LEVEL || 'INFO' }}
-                    PYTHONIOENCODING:        utf-8
+          PYTHONIOENCODING:        utf-8
         run: python main.py --once
