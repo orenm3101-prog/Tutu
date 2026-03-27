@@ -49,9 +49,10 @@ MADLAN_SEARCH_URL = (
     "?marketplace=residential"
 )
 
-# Regex to extract the SSR context JSON from the page HTML
-# The script contains: window.__SSR_HYDRATED_CONTEXT__={...}
-SSR_RE = re.compile(r'window\.__SSR_HYDRATED_CONTEXT__\s*=\s*(\{.*?\})\s*</script>', re.DOTALL)
+# Marker regex to locate __SSR_HYDRATED_CONTEXT__ in the page HTML.
+# We use string slicing (not a regex end-boundary) so that any </script>
+# text embedded inside JSON string values won't cause a premature cut-off.
+SSR_MARKER_RE = re.compile(r'window\.__SSR_HYDRATED_CONTEXT__\s*=\s*')
 
 # Realistic browser headers to avoid basic bot filters
 REQUEST_HEADERS = {
@@ -225,9 +226,9 @@ class MadlanScraper(BaseScraper):
         logger.info("[Madlan] Fetching page HTML to extract SSR listings...")
 
         try:
-                        resp = curl_requests.get(
+            resp = curl_requests.get(
                 MADLAN_SEARCH_URL,
-                                impersonate="chrome120",
+                impersonate="chrome120",
                 timeout=30,
             )
         except Exception as exc:
@@ -246,14 +247,23 @@ class MadlanScraper(BaseScraper):
         logger.info(f"[Madlan] Page fetched ({len(html):,} bytes). Extracting SSR data...")
 
         # ── Extract __SSR_HYDRATED_CONTEXT__ ──────────────────────────────────
-        match = SSR_RE.search(html)
-        if not match:
+        # Find where the JSON value starts, then slice to the next </script>.
+        # Using str.find() avoids regex stopping early on </script> inside JSON.
+        marker_match = SSR_MARKER_RE.search(html)
+        if not marker_match:
             logger.error("[Madlan] Could not find __SSR_HYDRATED_CONTEXT__ in page HTML.")
             logger.debug(f"[Madlan] HTML preview: {html[:500]}")
             return []
 
+        json_start = marker_match.end()
+        script_end = html.find('</script>', json_start)
+        if script_end == -1:
+            logger.error("[Madlan] Could not find </script> after SSR context.")
+            return []
+
+        json_text = html[json_start:script_end].strip().rstrip(';').strip()
         try:
-            ctx = json.loads(match.group(1))
+            ctx = json.loads(json_text)
         except json.JSONDecodeError as exc:
             logger.error(f"[Madlan] Failed to parse SSR JSON: {exc}")
             return []
